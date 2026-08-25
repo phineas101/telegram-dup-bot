@@ -62,6 +62,22 @@ DB_PATH = os.environ.get("DB_PATH", "/data/dup_bot.db")
 # โซนเวลาสำหรับแสดงผล (เวลาไทย) — เซิร์ฟเวอร์รันเป็น UTC จึงต้องแปลงก่อนแสดง
 TZ = ZoneInfo(os.environ.get("TZ_NAME", "Asia/Bangkok"))
 
+# คำที่ต้องเฝ้าระวัง (คั่นด้วยจุลภาค) ถ้าเจอในข้อความจะแจ้งเตือนทันที — แยกจากการตรวจซ้ำ
+# ใช้กรณีปกติถอนเป็นเงินวอน แต่บางสลิประบุ "บาท" = สกุลเงิน/บัญชีผิด ต้องเช็คก่อนถอน
+# ตั้งเป็นค่าว่างเพื่อปิดฟีเจอร์นี้
+ALERT_KEYWORDS = [
+    kw.strip().lower()
+    for kw in os.environ.get("ALERT_KEYWORDS", "บาท").split(",")
+    if kw.strip()
+]
+
+# ข้อความเตือนคำต้องระวัง ({keyword} = คำที่เจอ)
+ALERT_TEXT = os.environ.get(
+    "ALERT_TEXT",
+    "🚨 <b>ตรวจพบคำว่า «{keyword}»!</b>\n"
+    "ข้อความนี้เป็นการถอนเงิน{keyword} — โปรดตรวจสอบสกุลเงิน/บัญชีให้ถูกต้องก่อนทำรายการ 💱",
+)
+
 # ---------- ระบบ log ----------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -145,6 +161,15 @@ def is_number_only(text: str) -> bool:
     return stripped.isdigit()
 
 
+def find_alert_keyword(text: str) -> str | None:
+    """คืนคำต้องระวังคำแรกที่พบในข้อความ (เช่น 'บาท') / None ถ้าไม่พบ"""
+    low = text.lower()
+    for kw in ALERT_KEYWORDS:
+        if kw in low:
+            return kw
+    return None
+
+
 def make_hash(text: str) -> str:
     """สร้าง hash ของข้อความเพื่อเทียบแบบเร็วและประหยัดพื้นที่"""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -218,6 +243,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     text = normalize(raw)
+
+    # เตือนคำต้องระวัง (เช่น "บาท") — ตรวจแยกจากการตรวจซ้ำ และตรวจทุกข้อความ
+    keyword = find_alert_keyword(text)
+    if keyword is not None:
+        logger.info("พบคำต้องระวัง %r ในข้อความ: %r", keyword, text[:80])
+        try:
+            await message.reply_text(
+                ALERT_TEXT.format(keyword=keyword),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            logger.warning("ส่งเตือนคำต้องระวังไม่สำเร็จ: %s", e)
+
     if len(text) < MIN_LENGTH:
         return
 

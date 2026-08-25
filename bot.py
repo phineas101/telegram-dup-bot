@@ -115,6 +115,20 @@ def normalize(text: str) -> str:
     return " ".join(text.split())
 
 
+# เครื่องหมายคั่นที่พบในเลขบัญชี/เลขอ้างอิง จะถูกตัดออกก่อนเช็คว่าเป็นตัวเลขล้วนไหม
+_NUMBER_SEPARATORS = str.maketrans("", "", " -/.,()+฿")
+
+
+def is_number_only(text: str) -> bool:
+    """
+    True ถ้าข้อความเป็น 'ตัวเลขล้วน' (เช่น เลขบัญชี 110492152551 หรือ 110-492-152551)
+    ข้อความแบบนี้จะไม่ตรวจซ้ำ เพราะลูกค้าคนเดียวถอนหลายครั้งต่อวันได้
+    ส่วนข้อความที่มีตัวหนังสือปน (ข้อความถอนเงินเต็ม ๆ) จะไม่เข้าเงื่อนไขนี้ -> ยังตรวจซ้ำปกติ
+    """
+    stripped = text.translate(_NUMBER_SEPARATORS)
+    return stripped.isdigit()
+
+
 def make_hash(text: str) -> str:
     """สร้าง hash ของข้อความเพื่อเทียบแบบเร็วและประหยัดพื้นที่"""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -181,6 +195,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     text = normalize(raw)
     if len(text) < MIN_LENGTH:
+        return
+
+    # ข้ามข้อความที่เป็นตัวเลขล้วน (เช่น เลขบัญชี) — ไม่ตรวจซ้ำ
+    # เพราะลูกค้าคนเดียวถอนหลายครั้งต่อวันได้ ต้องส่งเลขบัญชีซ้ำเป็นเรื่องปกติ
+    if is_number_only(text):
+        logger.info("ข้ามข้อความตัวเลขล้วน (ไม่ตรวจซ้ำ): %r", text[:80])
         return
 
     chat_id = message.chat_id

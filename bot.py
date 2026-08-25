@@ -8,11 +8,13 @@
 ออกแบบไว้สำหรับงานส่งถอนเงินให้ลูกค้า ป้องกันการส่งซ้ำที่ทำให้เสียเงิน
 """
 
+import datetime
 import hashlib
 import logging
 import os
 import sqlite3
 import time
+from zoneinfo import ZoneInfo
 
 try:
     # โหลดค่าจากไฟล์ .env เมื่อรันบนเครื่องตัวเอง (ไม่มีก็ข้ามไป)
@@ -44,14 +46,21 @@ DUP_WINDOW_MINUTES = int(os.environ.get("DUP_WINDOW_MINUTES", "1440"))
 # ข้อความที่สั้นกว่านี้จะไม่ตรวจ (กันคำทั่วไป เช่น "โอเค", "ครับ")
 MIN_LENGTH = int(os.environ.get("MIN_LENGTH", "3"))
 
-# ข้อความเตือนเมื่อเจอซ้ำ ({ago} จะถูกแทนด้วยเวลาที่ผ่านมา)
+# ข้อความเตือนเมื่อเจอซ้ำ
+#   {ago}  = เวลาที่ผ่านมาตั้งแต่ส่งครั้งแรก (เช่น "7 นาที")
+#   {time} = เวลานาฬิกาที่ชัดเจนของข้อความแรก (เช่น "15:51 น.")
 WARNING_TEXT = os.environ.get(
     "WARNING_TEXT",
-    "⚠️ <b>ข้อความนี้ซ้ำ!</b>\nเคยส่งข้อความเดียวกันนี้มาแล้วเมื่อ {ago} ที่แล้ว\nโปรดตรวจสอบก่อนทำรายการซ้ำ 🔁",
+    "⚠️ <b>ข้อความนี้ซ้ำ!</b>\n"
+    "เคยส่งข้อความเดียวกันนี้ครั้งแรกไปแล้วเมื่อ {ago} ที่แล้ว (เวลา {time})\n"
+    "โปรดตรวจสอบก่อนทำรายการซ้ำ 🔁",
 )
 
 # ตำแหน่งไฟล์ฐานข้อมูล — ถ้าต่อ Volume ของ Railway ไว้ที่ /data จะเก็บถาวร
 DB_PATH = os.environ.get("DB_PATH", "/data/dup_bot.db")
+
+# โซนเวลาสำหรับแสดงผล (เวลาไทย) — เซิร์ฟเวอร์รันเป็น UTC จึงต้องแปลงก่อนแสดง
+TZ = ZoneInfo(os.environ.get("TZ_NAME", "Asia/Bangkok"))
 
 # ---------- ระบบ log ----------
 logging.basicConfig(
@@ -95,15 +104,22 @@ def get_db() -> sqlite3.Connection:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS messages (
-            chat_id INTEGER NOT NULL,
-            hash    TEXT    NOT NULL,
-            ts      REAL    NOT NULL,
-            msg_id  INTEGER,
+            chat_id  INTEGER NOT NULL,
+            hash     TEXT    NOT NULL,
+            ts       REAL    NOT NULL,   -- เวลาที่ส่งครั้งล่าสุด (ใช้กับกรอบเวลา 24 ชม.)
+            first_ts REAL,               -- เวลาที่ส่งครั้งแรก (ใช้แสดงในข้อความเตือน)
+            msg_id   INTEGER,
             PRIMARY KEY (chat_id, hash)
         )
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ts ON messages(ts)")
+
+    # migrate ฐานข้อมูลเดิมที่ยังไม่มีคอลัมน์ first_ts
+    columns = [r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()]
+    if "first_ts" not in columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN first_ts REAL")
+        conn.execute("UPDATE messages SET first_ts = ts WHERE first_ts IS NULL")
     conn.commit()
     _db = conn
     logger.info("ใช้ฐานข้อมูลที่: %s", path)
@@ -149,10 +165,19 @@ def human_ago(seconds: float) -> str:
     return f"{hours} ชั่วโมง"
 
 
+def format_clock(ts: float) -> str:
+    """แปลง timestamp เป็นเวลานาฬิกาไทยที่อ่านง่าย เช่น '15:51 น.' หรือ '24/08 15:51 น.' ถ้าคนละวัน"""
+    dt = datetime.datetime.fromtimestamp(ts, TZ)
+    today = datetime.datetime.now(TZ).date()
+    if dt.date() == today:
+        return dt.strftime("%H:%M น.")
+    return dt.strftime("%d/%m %H:%M น.")
+
+
 def check_and_record(chat_id: int, text: str, msg_id: int, now: float) -> float | None:
     """
     เทียบข้อความกับทุกข้อความในย้อนหลัง (ในช่วงเวลา) แล้วบันทึกข้อความนี้ลงฐานข้อมูล
-    คืนค่า: เวลา (วินาที) นับจากครั้งก่อนที่เคยส่งข้อความเดียวกัน ถ้าซ้ำ / None ถ้าไม่ซ้ำ
+    คืนค่า: เวลา (timestamp) ของข้อความ 'ครั้งแรก' ถ้าซ้ำ / None ถ้าไม่ซ้ำ
     """
     window = DUP_WINDOW_MINUTES * 60
     cutoff = now - window
@@ -164,22 +189,21 @@ def check_and_record(chat_id: int, text: str, msg_id: int, now: float) -> float 
 
     # 2) หาว่าเคยส่งข้อความเดียวกันในช่วงเวลานี้ไหม (ที่เหลืออยู่ = อยู่ในช่วงเวลาแน่นอน)
     row = db.execute(
-        "SELECT ts FROM messages WHERE chat_id = ? AND hash = ?",
+        "SELECT first_ts FROM messages WHERE chat_id = ? AND hash = ?",
         (chat_id, h),
     ).fetchone()
 
-    ago = None
-    if row is not None:
-        ago = now - row[0]
+    first_ts = row[0] if row is not None else None
 
-    # 3) บันทึก/อัปเดตข้อความนี้เป็นครั้งล่าสุด
+    # 3) บันทึกข้อความนี้: ถ้าซ้ำให้อัปเดตเวลาล่าสุด (คงเวลาข้อความแรกไว้)
+    #    ถ้าเป็นข้อความใหม่ ให้ตั้งทั้ง first_ts และ ts เป็นตอนนี้
     db.execute(
-        "INSERT INTO messages (chat_id, hash, ts, msg_id) VALUES (?, ?, ?, ?) "
+        "INSERT INTO messages (chat_id, hash, ts, first_ts, msg_id) VALUES (?, ?, ?, ?, ?) "
         "ON CONFLICT(chat_id, hash) DO UPDATE SET ts = excluded.ts, msg_id = excluded.msg_id",
-        (chat_id, h, now, msg_id),
+        (chat_id, h, now, now, msg_id),
     )
     db.commit()
-    return ago
+    return first_ts
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -206,13 +230,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_id = message.chat_id
     now = time.time()
 
-    ago = check_and_record(chat_id, text, message.message_id, now)
+    first_ts = check_and_record(chat_id, text, message.message_id, now)
 
-    if ago is not None:
-        logger.info("พบข้อความซ้ำในกลุ่ม %s (ห่างกัน %.0f วิ): %r", chat_id, ago, text[:80])
+    if first_ts is not None:
+        ago = now - first_ts
+        logger.info("พบข้อความซ้ำในกลุ่ม %s (ห่างครั้งแรก %.0f วิ): %r", chat_id, ago, text[:80])
         try:
             await message.reply_text(
-                WARNING_TEXT.format(ago=human_ago(ago)),
+                WARNING_TEXT.format(ago=human_ago(ago), time=format_clock(first_ts)),
                 parse_mode=ParseMode.HTML,
             )
         except Exception as e:  # กันบอทล่มถ้าตอบไม่ได้

@@ -53,6 +53,10 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+# ปิด log ของ httpx/telegram ที่ระดับ INFO เพราะมันจะพิมพ์ URL ที่มีโทเคนบอทออกมา
+# (กันโทเคนรั่วใน log) — เหลือไว้เฉพาะ WARNING ขึ้นไป
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # ---------- ที่เก็บประวัติข้อความ (ในหน่วยความจำ) ----------

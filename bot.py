@@ -12,6 +12,7 @@ import datetime
 import hashlib
 import logging
 import os
+import re
 import sqlite3
 import time
 from zoneinfo import ZoneInfo
@@ -62,21 +63,39 @@ DB_PATH = os.environ.get("DB_PATH", "/data/dup_bot.db")
 # โซนเวลาสำหรับแสดงผล (เวลาไทย) — เซิร์ฟเวอร์รันเป็น UTC จึงต้องแปลงก่อนแสดง
 TZ = ZoneInfo(os.environ.get("TZ_NAME", "Asia/Bangkok"))
 
-# คำที่ต้องเฝ้าระวัง (คั่นด้วยจุลภาค) ถ้าเจอในข้อความจะแจ้งเตือนทันที — แยกจากการตรวจซ้ำ
-# ใช้กรณีปกติถอนเป็นเงินวอน แต่บางสลิประบุ "บาท" = สกุลเงิน/บัญชีผิด ต้องเช็คก่อนถอน
-# ตั้งเป็นค่าว่างเพื่อปิดฟีเจอร์นี้
-ALERT_KEYWORDS = [
-    kw.strip().lower()
-    for kw in os.environ.get("ALERT_KEYWORDS", "บาท").split(",")
-    if kw.strip()
+# ตรวจ "ถอนต่างสกุลเงิน": ถ้าข้อความมีชื่อธนาคารเกาหลี (ในลิสต์) และมีคำว่า "บาท" พร้อมกัน
+# = สกุลเงินผิด (ธนาคารเกาหลีต้องเป็นวอน) -> เตือน
+# รายชื่อธนาคารเกาหลี (คั่นด้วยจุลภาค) — ใส่คำเด่น ๆ ของชื่อธนาคารก็พอ ไม่ต้องมีคำว่า Bank
+KOREAN_BANKS = [
+    b.strip()
+    for b in os.environ.get(
+        "KOREAN_BANKS",
+        "Hana,Woori,Kookmin,Shinhan,IBK,Jeonbuk,NH,Kyongnam,Gyongnam,"
+        "Kwangju,KFCC,KB,BNK,Jeju",
+    ).split(",")
+    if b.strip()
 ]
 
-# ข้อความเตือนคำต้องระวัง ({keyword} = คำที่เจอ)
-ALERT_TEXT = os.environ.get(
-    "ALERT_TEXT",
-    "🚨 <b>ตรวจพบคำว่า «{keyword}»!</b>\n"
-    "ข้อความนี้เป็นการถอนเงิน{keyword} — โปรดตรวจสอบสกุลเงิน/บัญชีให้ถูกต้องก่อนทำรายการ 💱",
+# คำบอกสกุลเงินที่ "ผิด" สำหรับธนาคารเกาหลี (คั่นด้วยจุลภาค)
+CURRENCY_WORDS = [
+    w.strip()
+    for w in os.environ.get("CURRENCY_WORDS", "บาท,THB").split(",")
+    if w.strip()
+]
+
+# ข้อความเตือนเมื่อเจอถอนต่างสกุลเงิน ({bank} = ชื่อธนาคารที่เจอ)
+CURRENCY_ALERT_TEXT = os.environ.get(
+    "CURRENCY_ALERT_TEXT",
+    "🚨 <b>เตือน: ถอนต่างสกุลเงิน!</b>\n"
+    "สลิปนี้เป็นธนาคารเกาหลี ({bank}) แต่ระบุเป็น «บาท» — ปกติต้องเป็นวอน (KRW)\n"
+    "โปรดตรวจสอบก่อนถอน 💱",
 )
+
+# regex จับชื่อธนาคารเกาหลีแบบคำเต็ม (กันไปตรงกับตัวอักษรในโค้ดสุ่ม)
+_KOREAN_BANK_RE = re.compile(
+    r"\b(" + "|".join(re.escape(b) for b in KOREAN_BANKS) + r")\b",
+    re.IGNORECASE,
+) if KOREAN_BANKS else None
 
 # ---------- ระบบ log ----------
 logging.basicConfig(
@@ -161,13 +180,18 @@ def is_number_only(text: str) -> bool:
     return stripped.isdigit()
 
 
-def find_alert_keyword(text: str) -> str | None:
-    """คืนคำต้องระวังคำแรกที่พบในข้อความ (เช่น 'บาท') / None ถ้าไม่พบ"""
+def currency_mismatch_bank(text: str) -> str | None:
+    """
+    ถ้าข้อความมีทั้ง 'ธนาคารเกาหลี' และ 'คำว่าบาท' พร้อมกัน = ถอนต่างสกุลเงิน
+    คืนชื่อธนาคารที่เจอ / None ถ้าไม่เข้าเงื่อนไข
+    """
+    if _KOREAN_BANK_RE is None:
+        return None
     low = text.lower()
-    for kw in ALERT_KEYWORDS:
-        if kw in low:
-            return kw
-    return None
+    if not any(w.lower() in low for w in CURRENCY_WORDS):
+        return None
+    m = _KOREAN_BANK_RE.search(text)
+    return m.group(1) if m else None
 
 
 def make_hash(text: str) -> str:
@@ -244,17 +268,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     text = normalize(raw)
 
-    # เตือนคำต้องระวัง (เช่น "บาท") — ตรวจแยกจากการตรวจซ้ำ และตรวจทุกข้อความ
-    keyword = find_alert_keyword(text)
-    if keyword is not None:
-        logger.info("พบคำต้องระวัง %r ในข้อความ: %r", keyword, text[:80])
+    # เตือน "ถอนต่างสกุลเงิน" — ธนาคารเกาหลี + คำว่าบาท พร้อมกัน (ตรวจแยกจากการตรวจซ้ำ)
+    bank = currency_mismatch_bank(text)
+    if bank is not None:
+        logger.info("พบถอนต่างสกุลเงิน (ธนาคาร %r + บาท): %r", bank, text[:80])
         try:
             await message.reply_text(
-                ALERT_TEXT.format(keyword=keyword),
+                CURRENCY_ALERT_TEXT.format(bank=bank),
                 parse_mode=ParseMode.HTML,
             )
         except Exception as e:
-            logger.warning("ส่งเตือนคำต้องระวังไม่สำเร็จ: %s", e)
+            logger.warning("ส่งเตือนสกุลเงินไม่สำเร็จ: %s", e)
 
     if len(text) < MIN_LENGTH:
         return

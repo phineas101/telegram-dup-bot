@@ -53,15 +53,15 @@ MIN_LENGTH = int(os.environ.get("MIN_LENGTH", "3"))
 WARNING_TEXT = os.environ.get(
     "WARNING_TEXT",
     "⚠️ <b>ข้อความนี้ซ้ำ!</b>\n"
-    "เคยส่งข้อความเดียวกันนี้ครั้งแรกไปแล้วเมื่อ {ago} ที่แล้ว (เวลา {time})\n"
+    "เคยส่งข้อความเดียวกันนี้ไปแล้วเมื่อ {ago} ที่แล้ว (เวลา {time})\n"
     "โปรดตรวจสอบก่อนทำรายการซ้ำ 🔁",
 )
 
-# สเต็ป 2: ข้อความที่บอทจะ reply ไปที่ "ข้อความต้นฉบับ" (อันแรก) เพื่อให้กดแล้วเด้งไปดูได้
+# สเต็ป 2: ข้อความที่บอทจะ reply ไปที่ "ข้อความก่อนหน้า" (ครั้งล่าสุดที่ส่งก่อนอันนี้)
 # ตั้งเป็นค่าว่างเพื่อปิดสเต็ป 2 (ให้เหลือแค่แจ้งเตือน)
 ORIGINAL_QUOTE_TEXT = os.environ.get(
     "ORIGINAL_QUOTE_TEXT",
-    "☝️ <b>นี่คือข้อความต้นฉบับ</b> ที่เพิ่งถูกส่งซ้ำ (ส่งครั้งแรกเมื่อ {time})",
+    "☝️ <b>นี่คือข้อความก่อนหน้าที่เหมือนกัน</b> (ส่งเมื่อ {time})",
 )
 
 # ตำแหน่งไฟล์ฐานข้อมูล — ถ้าต่อ Volume ของ Railway ไว้ที่ /data จะเก็บถาวร
@@ -235,7 +235,8 @@ def check_and_record(
 ) -> tuple[float, int | None] | None:
     """
     เทียบข้อความกับทุกข้อความในย้อนหลัง (ในช่วงเวลา) แล้วบันทึกข้อความนี้ลงฐานข้อมูล
-    คืนค่า: (เวลาข้อความครั้งแรก, id ข้อความครั้งแรก) ถ้าซ้ำ / None ถ้าไม่ซ้ำ
+    คืนค่า: (เวลาครั้งก่อนหน้า, id ข้อความครั้งก่อนหน้า) ถ้าซ้ำ / None ถ้าไม่ซ้ำ
+    ครั้งก่อนหน้าอยู่ในกรอบเวลา (24 ชม.) เสมอ
     """
     window = DUP_WINDOW_MINUTES * 60
     cutoff = now - window
@@ -245,20 +246,19 @@ def check_and_record(
     # 1) ลบข้อความที่เก่ากว่าช่วงเวลาออก (นับย้อนหลังจาก "ตอนนี้")
     db.execute("DELETE FROM messages WHERE ts < ?", (cutoff,))
 
-    # 2) หาว่าเคยส่งข้อความเดียวกันในช่วงเวลานี้ไหม (ที่เหลืออยู่ = อยู่ในช่วงเวลาแน่นอน)
-    #    msg_id ในตารางคือ id ของ "ข้อความแรก" (คงที่ ไม่อัปเดตตอนซ้ำ) ใช้ reply กลับได้
+    # 2) ดึง "ครั้งก่อนหน้า" (ts + msg_id ล่าสุดที่เก็บไว้) — ที่เหลืออยู่ = อยู่ในกรอบ 24 ชม. เสมอ
+    #    (เพราะข้อ 1 ลบตัวที่เกินกรอบทิ้งไปแล้ว) จึงการันตีว่าเวลาในตัวเตือนไม่เกิน 24 ชม.
     row = db.execute(
-        "SELECT first_ts, msg_id FROM messages WHERE chat_id = ? AND hash = ?",
+        "SELECT ts, msg_id FROM messages WHERE chat_id = ? AND hash = ?",
         (chat_id, h),
     ).fetchone()
 
     result = (row[0], row[1]) if row is not None else None
 
-    # 3) บันทึกข้อความนี้: ถ้าซ้ำให้อัปเดตแค่เวลาล่าสุด (คง first_ts และ msg_id ของข้อความแรกไว้)
-    #    ถ้าเป็นข้อความใหม่ ให้ตั้ง first_ts, ts และ msg_id เป็นของข้อความนี้
+    # 3) บันทึกข้อความนี้เป็น "ครั้งล่าสุด" (อัปเดตทั้งเวลาและ msg_id เพื่อให้ครั้งหน้าอ้างอิงอันนี้)
     db.execute(
         "INSERT INTO messages (chat_id, hash, ts, first_ts, msg_id) VALUES (?, ?, ?, ?, ?) "
-        "ON CONFLICT(chat_id, hash) DO UPDATE SET ts = excluded.ts",
+        "ON CONFLICT(chat_id, hash) DO UPDATE SET ts = excluded.ts, msg_id = excluded.msg_id",
         (chat_id, h, now, now, msg_id),
     )
     db.commit()
@@ -305,33 +305,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     result = check_and_record(chat_id, text, message.message_id, now)
 
     if result is not None:
-        first_ts, first_msg_id = result
-        ago = now - first_ts
-        logger.info("พบข้อความซ้ำในกลุ่ม %s (ห่างครั้งแรก %.0f วิ): %r", chat_id, ago, text[:80])
+        prev_ts, prev_msg_id = result
+        ago = now - prev_ts
+        logger.info("พบข้อความซ้ำในกลุ่ม %s (ห่างครั้งก่อน %.0f วิ): %r", chat_id, ago, text[:80])
 
         # สเต็ป 1: แจ้งเตือน (reply ไปที่ข้อความซ้ำอันใหม่)
         try:
             await message.reply_text(
-                WARNING_TEXT.format(ago=human_ago(ago), time=format_clock(first_ts)),
+                WARNING_TEXT.format(ago=human_ago(ago), time=format_clock(prev_ts)),
                 parse_mode=ParseMode.HTML,
             )
         except Exception as e:  # กันบอทล่มถ้าตอบไม่ได้
             logger.warning("ตอบข้อความเตือนไม่สำเร็จ: %s", e)
 
-        # สเต็ป 2: reply ไปที่ "ข้อความต้นฉบับ" (อันแรก) เพื่อให้กดแล้วเด้งไปดูได้
-        if ORIGINAL_QUOTE_TEXT and first_msg_id:
+        # สเต็ป 2: reply ไปที่ "ข้อความก่อนหน้า" (ครั้งล่าสุด) เพื่อให้กดแล้วเด้งไปดูได้
+        if ORIGINAL_QUOTE_TEXT and prev_msg_id:
             try:
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=ORIGINAL_QUOTE_TEXT.format(time=format_clock(first_ts)),
+                    text=ORIGINAL_QUOTE_TEXT.format(time=format_clock(prev_ts)),
                     parse_mode=ParseMode.HTML,
                     reply_parameters=ReplyParameters(
-                        message_id=first_msg_id,
+                        message_id=prev_msg_id,
                         allow_sending_without_reply=True,
                     ),
                 )
             except Exception as e:
-                logger.warning("reply ข้อความต้นฉบับไม่สำเร็จ: %s", e)
+                logger.warning("reply ข้อความก่อนหน้าไม่สำเร็จ: %s", e)
     else:
         logger.info("ข้อความใหม่ในกลุ่ม %s: %r", chat_id, text[:80])
 

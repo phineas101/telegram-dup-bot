@@ -84,9 +84,11 @@ KOREAN_BANKS = [
 ]
 
 # คำบอกสกุลเงินที่ "ผิด" สำหรับธนาคารเกาหลี (คั่นด้วยจุลภาค)
+# ใช้เฉพาะคำไทย "บาท" — ไม่ใส่คำอังกฤษสั้น ๆ (เช่น THB) เพราะอาจไปตรงกับตัวอักษร
+# ในโค้ดสุ่มหน้าสลิปโดยบังเอิญ (เช่น ufdbkgsiBeThBUkM มี "ThB")
 CURRENCY_WORDS = [
     w.strip()
-    for w in os.environ.get("CURRENCY_WORDS", "บาท,THB").split(",")
+    for w in os.environ.get("CURRENCY_WORDS", "บาท").split(",")
     if w.strip()
 ]
 

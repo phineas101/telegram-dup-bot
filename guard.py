@@ -271,8 +271,8 @@ def _status_th(s) -> str:
     return _STATUS_TH.get(s, str(s))
 
 
-def _person_block(title: str, user, role: str = "") -> str:
-    """บล็อกข้อมูลผู้ใช้แบบอ่านง่าย: หัวข้อ / ชื่อ+ป้าย / ตำแหน่ง / user id"""
+def _person_block(title: str, user, role: str = "", custom_title: str = "", bio: str = "") -> str:
+    """บล็อกข้อมูลผู้ใช้แบบอ่านง่าย: หัวข้อ / ชื่อ+ป้าย / ตำแหน่ง / bio / user id"""
     if user is None:
         return f"{title}\n—"
     name = mention(user)
@@ -289,9 +289,71 @@ def _person_block(title: str, user, role: str = "") -> str:
     tail = ("  " + " ".join(badges)) if badges else ""
     lines = [title, f"{name}{tail}"]
     if role:
-        lines.append(f"📋 ตำแหน่ง: {role}")
+        r = f"📋 ตำแหน่ง: {role}"
+        if custom_title:
+            r += f" · ยศ: {html.escape(custom_title)}"
+        lines.append(r)
+    if bio:
+        lines.append(f"📝 {html.escape(bio[:150])}")
     lines.append(f"🆔 <code>{user.id}</code>")
     return "\n".join(lines)
+
+
+async def _enrich(context, chat, victim, actor, self_act: bool) -> dict:
+    """ดึงข้อมูลเสริม (best-effort): จำนวนสมาชิก, ยศ/bio คนทำ, bio เหยื่อ, ลิงก์/คำอธิบายกลุ่ม"""
+    info: dict = {}
+    try:
+        info["count"] = await context.bot.get_chat_member_count(chat.id)
+    except Exception:  # noqa: BLE001
+        pass
+    if actor and not self_act:
+        try:
+            am = await context.bot.get_chat_member(chat.id, actor.id)
+            info["actor_role"] = _status_th(am.status)
+            info["actor_title"] = getattr(am, "custom_title", None) or ""
+        except Exception:  # noqa: BLE001
+            pass
+    for who, u in (("victim_bio", victim), ("actor_bio", None if self_act else actor)):
+        if u:
+            try:
+                cu = await context.bot.get_chat(u.id)
+                b = getattr(cu, "bio", None)
+                if b:
+                    info[who] = b
+            except Exception:  # noqa: BLE001
+                pass
+    try:
+        gc = await context.bot.get_chat(chat.id)
+        info["group_desc"] = getattr(gc, "description", None) or ""
+        un = getattr(gc, "username", None)
+        info["group_link"] = f"@{un}" if un else ""
+    except Exception:  # noqa: BLE001
+        pass
+    return info
+
+
+def _build_card(header, chat, victim, actor, self_act, info, meta_lines) -> str:
+    """สร้างการ์ดรายงานร่วม (ใช้ทั้ง chat_member และ service message)"""
+    blocks = [
+        f"{header}\n━━━━━━━━━━━━━━━",
+        _person_block("👤 <b>สมาชิก</b>", victim, bio=info.get("victim_bio", "")),
+    ]
+    if not self_act and actor:
+        blocks.append(_person_block(
+            "🙋 <b>ผู้ทำรายการ</b>", actor,
+            info.get("actor_role", ""), info.get("actor_title", ""), info.get("actor_bio", ""),
+        ))
+    if meta_lines:
+        blocks.append("\n".join(meta_lines))
+    glines = [f"👥 กลุ่ม: {html.escape(chat.title or '')}", f"🆔 <code>{chat.id}</code>"]
+    if info.get("group_link"):
+        glines.append(f"🔗 {info['group_link']}")
+    if info.get("group_desc"):
+        glines.append(f"📝 {html.escape(info['group_desc'][:120])}")
+    if info.get("count") is not None:
+        glines.append(f"📊 สมาชิกตอนนี้: {info['count']} คน")
+    blocks.append("\n".join(glines))
+    return "\n\n".join(blocks)
 
 
 _audit_seen: dict[str, float] = {}
@@ -318,20 +380,7 @@ async def _audit(context, ev) -> None:
     actor = ev.from_user
     self_act = actor is not None and actor.id == victim.id
 
-    # ข้อมูลเสริม (best-effort — เรียกไม่ได้ก็ข้าม)
-    count_line = ""
-    try:
-        n = await context.bot.get_chat_member_count(chat.id)
-        count_line = f"📊 สมาชิกตอนนี้: {n} คน"
-    except Exception:  # noqa: BLE001
-        pass
-    actor_role = ""
-    if actor and not self_act:
-        try:
-            am = await context.bot.get_chat_member(chat.id, actor.id)
-            actor_role = _status_th(am.status)
-        except Exception:  # noqa: BLE001
-            pass
+    info = await _enrich(context, chat, victim, actor, self_act)
 
     # ลิงก์ที่ใช้เข้ากลุ่ม (เฉพาะตอนเข้าใหม่)
     join_line = ""
@@ -348,25 +397,13 @@ async def _audit(context, ev) -> None:
 
     trans_line = f"🔁 สถานะ: {_status_th(old)} → {_status_th(new)}"
     time_line = f"🕐 {_fmt_time(ev.date)}"
-    group_line = f"👥 กลุ่ม: {html.escape(chat.title or '')}\n🆔 <code>{chat.id}</code>"
 
     def card(header: str) -> str:
-        blocks = [
-            f"{header}\n━━━━━━━━━━━━━━━",
-            _person_block("👤 <b>สมาชิก</b>", victim),
-        ]
-        if not self_act:
-            blocks.append(_person_block("🙋 <b>ผู้ทำรายการ</b>", actor, actor_role))
         meta = [trans_line]
         if join_line:
             meta.append(join_line)
         meta.append(time_line)
-        blocks.append("\n".join(meta))
-        grp = [group_line]
-        if count_line:
-            grp.append(count_line)
-        blocks.append("\n".join(grp))
-        return "\n\n".join(blocks)
+        return _build_card(header, chat, victim, actor, self_act, info, meta)
 
     if old in _PRESENT and new in _GONE:
         if not _audit_once(chat.id, victim.id, "leave"):
@@ -523,54 +560,29 @@ async def _rescue(context, chat, actor, victim) -> None:
 
 
 async def _audit_service(context, message) -> None:
-    """audit กลุ่มธรรมดา — จับจาก 'ข้อความระบบ' (ไม่ต้องเป็นแอดมิน แค่อยู่ในกลุ่ม+ปิด privacy)"""
+    """audit กลุ่มธรรมดา/supergroup ไม่ใช่แอดมิน — จับจาก 'ข้อความระบบ' (แค่อยู่ในกลุ่ม+ปิด privacy)"""
     chat = message.chat
     actor = message.from_user
-    when = message.date
+    time_line = f"🕐 {_fmt_time(message.date)}"
 
-    count_line = ""
-    try:
-        n = await context.bot.get_chat_member_count(chat.id)
-        count_line = f"📊 สมาชิกตอนนี้: {n} คน"
-    except Exception:  # noqa: BLE001
-        pass
-    actor_role = ""
-    if actor:
-        try:
-            am = await context.bot.get_chat_member(chat.id, actor.id)
-            actor_role = _status_th(am.status)
-        except Exception:  # noqa: BLE001
-            pass
-
-    time_line = f"🕐 {_fmt_time(when)}"
-    group_line = f"👥 กลุ่ม: {html.escape(chat.title or '')}\n🆔 <code>{chat.id}</code>"
-
-    def card(header: str, victim) -> str:
+    async def emit(header, victim) -> None:
         self_act = actor is not None and actor.id == victim.id
-        blocks = [f"{header}\n━━━━━━━━━━━━━━━", _person_block("👤 <b>สมาชิก</b>", victim)]
-        if not self_act:
-            blocks.append(_person_block("🙋 <b>ผู้ทำรายการ</b>", actor, actor_role))
-        blocks.append(time_line)
-        grp = [group_line]
-        if count_line:
-            grp.append(count_line)
-        blocks.append("\n".join(grp))
-        return "\n\n".join(blocks)
+        info = await _enrich(context, chat, victim, actor, self_act)
+        await _broadcast(context, chat,
+                         _build_card(header, chat, victim, actor, self_act, info, [time_line]))
 
     if message.left_chat_member is not None:
         v = message.left_chat_member
         if v.id != context.bot.id and _audit_once(chat.id, v.id, "leave"):
             self_act = actor is not None and actor.id == v.id
-            header = "👋 <b>ออกจากกลุ่มเอง</b>" if self_act else "🦶 <b>ถูกเตะออกจากกลุ่ม</b>"
-            await _broadcast(context, chat, card(header, v))
+            await emit("👋 <b>ออกจากกลุ่มเอง</b>" if self_act else "🦶 <b>ถูกเตะออกจากกลุ่ม</b>", v)
     for v in (message.new_chat_members or []):
         if v.id == context.bot.id:  # บอทเข้าเอง — ข้าม (มี on_my_chat_member แล้ว)
             continue
         if not _audit_once(chat.id, v.id, "join"):
             continue
         self_act = actor is not None and actor.id == v.id
-        header = "➕ <b>เข้ากลุ่มเอง</b>" if self_act else "➕ <b>ถูกเพิ่มเข้ากลุ่ม</b>"
-        await _broadcast(context, chat, card(header, v))
+        await emit("➕ <b>เข้ากลุ่มเอง</b>" if self_act else "➕ <b>ถูกเพิ่มเข้ากลุ่ม</b>", v)
 
 
 async def on_service_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

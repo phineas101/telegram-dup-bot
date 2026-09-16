@@ -58,7 +58,10 @@ def _env_int(name: str, default: int) -> int:
 # ---------- การตั้งค่า (env) — ค่าเริ่มต้นปลอดภัย ----------
 GUARD_ENABLED = _env_bool("GUARD_ENABLED", True)          # สวิตช์ใหญ่
 OWNER_ID = _env_int("OWNER_ID", 0)                        # เจ้าของบอท (0 = ยังไม่ตั้ง)
-LOG_CHAT_ID = _env_int("LOG_CHAT_ID", 0)                  # ห้องรับแจ้งเตือน (0 = ไม่มี)
+LOG_CHAT_ID = _env_int("LOG_CHAT_ID", 0)                  # ห้อง Log ส่วนตัว (0 = ไม่มี)
+LOG_THREAD_ID = _env_int("LOG_THREAD_ID", 0)              # topic id ในห้อง Log (0 = ไม่เจาะ topic)
+# ส่งแจ้งเตือน "เฉพาะห้อง Log" (เงียบในกลุ่มที่เกิดเหตุ) — ต้องตั้ง LOG_CHAT_ID ด้วย
+AUDIT_LOG_ONLY = _env_bool("AUDIT_LOG_ONLY", False)
 
 # กันเตะ: off | audit (แจ้งทุกการเข้า-ออก-เตะ-เพิ่ม ไม่กรองใคร ไม่ตอบโต้)
 #         | alert (แจ้งเฉพาะคนไม่ไว้ใจเตะ) | enforce (ตอบโต้จริง: ถอดแอดมิน+กู้เหยื่อ)
@@ -213,20 +216,24 @@ async def is_exempt(chat_id: int, user, bot) -> bool:
     return user.id in await _admin_ids(chat_id, bot)
 
 
-async def _notify(context, chat_id: int, text: str) -> None:
+async def _notify(context, chat_id: int, text: str, thread_id: int = 0) -> None:
+    kwargs = {"parse_mode": "HTML", "disable_web_page_preview": True}
+    if thread_id:
+        kwargs["message_thread_id"] = thread_id
     try:
-        await context.bot.send_message(
-            chat_id, text, parse_mode="HTML", disable_web_page_preview=True
-        )
+        await context.bot.send_message(chat_id, text, **kwargs)
     except Exception as e:  # noqa: BLE001
         log.warning("แจ้งเตือนในแชท %s ไม่สำเร็จ: %s", chat_id, e)
 
 
 async def _broadcast(context, chat, text: str) -> None:
-    """แจ้งเตือนในกลุ่มที่เกิดเหตุ (รองรับหลายกลุ่มอัตโนมัติ) + ห้อง log กลางถ้าตั้งไว้"""
-    await _notify(context, chat.id, text)
+    """แจ้งในกลุ่มที่เกิดเหตุ + ห้อง Log (ถ้าตั้ง) / หรือเฉพาะห้อง Log ถ้า AUDIT_LOG_ONLY"""
+    # ส่งในกลุ่มที่เกิดเหตุ ยกเว้นตั้งให้ส่งเฉพาะห้อง Log
+    if not (AUDIT_LOG_ONLY and LOG_CHAT_ID):
+        await _notify(context, chat.id, text)
+    # ส่งเข้าห้อง Log ส่วนตัว (สำเนาที่คนในกลุ่มลบไม่ได้) — เจาะ topic ถ้าตั้งไว้
     if LOG_CHAT_ID and LOG_CHAT_ID != chat.id:
-        await _notify(context, LOG_CHAT_ID, text)
+        await _notify(context, LOG_CHAT_ID, text, LOG_THREAD_ID)
 
 
 # ================= 1) กันเตะ =================
@@ -816,7 +823,7 @@ async def _notify_admins(context, text: str) -> None:
         log.warning("บอทถูกเอาออก/ถอด แต่ไม่มี LOG_CHAT_ID/OWNER_ID ให้แจ้ง — ตั้งไว้จะได้รู้ทัน")
         return
     for t in targets:
-        await _notify(context, t, text)
+        await _notify(context, t, text, LOG_THREAD_ID if t == LOG_CHAT_ID else 0)
 
 
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -883,11 +890,13 @@ async def _owner_only(update: Update) -> bool:
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     u, c = update.effective_user, update.effective_chat
-    await update.effective_message.reply_text(
-        f"👤 user id: <code>{u.id}</code>\n💬 chat id: <code>{c.id}</code>\n"
-        f"ชนิดแชท: <code>{c.type}</code>",
-        parse_mode="HTML",
-    )
+    m = update.effective_message
+    txt = (f"👤 user id: <code>{u.id}</code>\n💬 chat id: <code>{c.id}</code>\n"
+           f"ชนิดแชท: <code>{c.type}</code>")
+    tid = getattr(m, "message_thread_id", None)
+    if tid:
+        txt += f"\n🧵 topic id: <code>{tid}</code>"
+    await m.reply_text(txt, parse_mode="HTML")
 
 
 async def cmd_trust(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -958,7 +967,8 @@ async def cmd_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"กันสแปม: {'เปิด' if ANTISPAM_ENABLED else 'ปิด'} "
         f"(ฟลัด {FLOOD_MAX_MSGS}/{FLOOD_WINDOW_SEC}s, ลิงก์ {'เปิด' if LINKS_ENABLED else 'ปิด'}, "
         f"คำต้องห้าม {len(BADWORDS)} คำ)",
-        f"OWNER_ID: {OWNER_ID or 'ยังไม่ตั้ง'} | LOG_CHAT_ID: {LOG_CHAT_ID or 'ไม่มี'}",
+        f"OWNER_ID: {OWNER_ID or 'ยังไม่ตั้ง'} | LOG_CHAT_ID: {LOG_CHAT_ID or 'ไม่มี'}"
+        + (" (ส่งเฉพาะ Log)" if AUDIT_LOG_ONLY and LOG_CHAT_ID else ""),
         f"แอดมินที่ไว้ใจ: {len(get_trusted())} คน",
     ]
     await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")

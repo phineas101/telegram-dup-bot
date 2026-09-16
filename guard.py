@@ -206,16 +206,20 @@ async def is_exempt(chat_id: int, user, bot) -> bool:
     return user.id in await _admin_ids(chat_id, bot)
 
 
-async def _alert(context, text: str) -> None:
-    target = LOG_CHAT_ID or OWNER_ID
-    if not target:
-        return
+async def _notify(context, chat_id: int, text: str) -> None:
     try:
         await context.bot.send_message(
-            target, text, parse_mode="HTML", disable_web_page_preview=True
+            chat_id, text, parse_mode="HTML", disable_web_page_preview=True
         )
     except Exception as e:  # noqa: BLE001
-        log.warning("ส่ง alert ไม่สำเร็จ: %s", e)
+        log.warning("แจ้งเตือนในแชท %s ไม่สำเร็จ: %s", chat_id, e)
+
+
+async def _broadcast(context, chat, text: str) -> None:
+    """แจ้งเตือนในกลุ่มที่เกิดเหตุ (รองรับหลายกลุ่มอัตโนมัติ) + ห้อง log กลางถ้าตั้งไว้"""
+    await _notify(context, chat.id, text)
+    if LOG_CHAT_ID and LOG_CHAT_ID != chat.id:
+        await _notify(context, LOG_CHAT_ID, text)
 
 
 # ================= 1) กันเตะ =================
@@ -254,10 +258,10 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
         # แอดมินไม่ระบุตัว — ระบุคนเตะไม่ได้ → แจ้งอย่างเดียว
         if _is_anonymous(actor, chat):
-            await _alert(
-                context,
+            await _broadcast(
+                context, chat,
                 f"⚠️ มีการเตะ {mention(victim)} โดย <b>แอดมินไม่ระบุตัว</b> "
-                f"ในกลุ่ม {html.escape(chat.title or '')} — ระบุคนทำไม่ได้",
+                f"— ระบุคนทำไม่ได้",
             )
             return
         # เจ้าของบอท/แอดมินที่ไว้ใจ → ปกติ
@@ -273,11 +277,11 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         if ANTIKICK_MODE == "enforce":
             await _rescue(context, chat, actor, victim)
-        else:  # alert
-            await _alert(
-                context,
+        else:  # alert — โพสต์ในกลุ่มที่เกิดเหตุ (รองรับหลายกลุ่มอัตโนมัติ)
+            await _broadcast(
+                context, chat,
                 f"🛡️ ตรวจพบการเตะ: {mention(victim)} ถูกเตะโดย {mention(actor)} "
-                f"ในกลุ่ม {html.escape(chat.title or '')} (โหมดแจ้งเตือน — ยังไม่ตอบโต้)",
+                f"(โหมดแจ้งเตือน — ยังไม่ตอบโต้)",
             )
         return
 
@@ -291,10 +295,9 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         and actor.id not in get_trusted()
         and not _is_anonymous(actor, chat)
     ):
-        await _alert(
-            context,
-            f"⚠️ {mention(victim)} ถูกตั้งเป็นแอดมินโดย {mention(actor)} "
-            f"ในกลุ่ม {html.escape(chat.title or '')} — ตรวจสอบด้วย",
+        await _broadcast(
+            context, chat,
+            f"⚠️ {mention(victim)} ถูกตั้งเป็นแอดมินโดย {mention(actor)} — ตรวจสอบด้วย",
         )
 
 
@@ -347,13 +350,7 @@ async def _rescue(context, chat, actor, victim) -> None:
     )
     if invite:
         msg += "\nส่งลิงก์เชิญกลับให้เหยื่อทาง DM แล้ว"
-    try:
-        await context.bot.send_message(
-            chat.id, msg, parse_mode="HTML", disable_web_page_preview=True
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    await _alert(context, msg + f"\nกลุ่ม: {html.escape(chat.title or '')}")
+    await _broadcast(context, chat, msg)
 
 
 # ================= 2) แคปช่า =================

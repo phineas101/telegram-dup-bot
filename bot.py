@@ -25,6 +25,15 @@ try:
 except ImportError:
     pass
 
+# กัน console Windows (cp874) พังตอน log อีโมจิ/ภาษาไทย — บน Railway (UTF-8) ไม่มีผล
+import sys
+
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 from telegram import ReplyParameters, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -116,6 +125,14 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+# ---------- ฟีเจอร์เสริม: ระบบป้องกันกลุ่ม (guard.py) ----------
+# ครอบ try/except ให้บอทเดิม (ตรวจซ้ำ/สกุลเงิน) ทำงานต่อได้แม้ guard มีปัญหา
+try:
+    import guard
+except Exception:
+    guard = None
+    logger.error("โหลด guard.py ไม่สำเร็จ — บอทเดิมทำงานต่อได้ปกติ", exc_info=True)
 
 # ---------- ฐานข้อมูล (SQLite) ----------
 _db: sqlite3.Connection | None = None
@@ -384,6 +401,13 @@ def main() -> None:
             handle_message,
         )
     )
+
+    # ฟีเจอร์เสริม: ระบบป้องกันกลุ่ม (กันเตะ/แคปช่า/กันสแปม) — ไม่กระทบของเดิม
+    if guard is not None:
+        try:
+            guard.register(app)
+        except Exception:
+            logger.error("guard.register ล้มเหลว — บอทเดิมทำงานต่อ", exc_info=True)
 
     logger.info("บอทเริ่มทำงาน (ช่วงเวลาตรวจซ้ำ = %s นาที)", DUP_WINDOW_MINUTES)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)

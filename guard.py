@@ -287,6 +287,21 @@ def _person_block(title: str, user, role: str = "") -> str:
     return "\n".join(lines)
 
 
+_audit_seen: dict[str, float] = {}
+
+
+def _audit_once(chat_id: int, user_id: int, kind: str, ttl: float = 25) -> bool:
+    """คืน True ถ้าเหตุการณ์นี้ยังไม่เคยแจ้งในช่วง ttl — กันแจ้งซ้ำเมื่อมาทั้ง chat_member และ service"""
+    now = time.time()
+    for k in [k for k, exp in _audit_seen.items() if exp < now]:
+        _audit_seen.pop(k, None)
+    key = f"{chat_id}:{user_id}:{kind}"
+    if _audit_seen.get(key, 0) > now:
+        return False
+    _audit_seen[key] = now + ttl
+    return True
+
+
 async def _audit(context, ev) -> None:
     """โหมด audit — การ์ดรายงานละเอียดสุด อ่านง่าย ทุกความเคลื่อนไหว (ไม่กรองใคร ไม่ตอบโต้)"""
     chat = ev.chat
@@ -347,6 +362,8 @@ async def _audit(context, ev) -> None:
         return "\n\n".join(blocks)
 
     if old in _PRESENT and new in _GONE:
+        if not _audit_once(chat.id, victim.id, "leave"):
+            return
         if self_act:
             header = "👋 <b>ออกจากกลุ่มเอง</b>"
         elif new == ChatMemberStatus.BANNED:
@@ -357,15 +374,19 @@ async def _audit(context, ev) -> None:
         return
 
     if old in _GONE and new == ChatMemberStatus.MEMBER:
+        if not _audit_once(chat.id, victim.id, "join"):
+            return
         header = "➕ <b>เข้ากลุ่มเอง</b>" if self_act else "➕ <b>ถูกเพิ่มเข้ากลุ่ม</b>"
         await _broadcast(context, chat, card(header))
         return
 
     if new == ChatMemberStatus.ADMINISTRATOR and old != ChatMemberStatus.ADMINISTRATOR:
-        await _broadcast(context, chat, card("⭐ <b>ถูกตั้งเป็นแอดมิน</b>"))
+        if _audit_once(chat.id, victim.id, "adminup"):
+            await _broadcast(context, chat, card("⭐ <b>ถูกตั้งเป็นแอดมิน</b>"))
         return
     if old == ChatMemberStatus.ADMINISTRATOR and new in {ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED}:
-        await _broadcast(context, chat, card("🔻 <b>ถูกถอดจากแอดมิน</b>"))
+        if _audit_once(chat.id, victim.id, "admindn"):
+            await _broadcast(context, chat, card("🔻 <b>ถูกถอดจากแอดมิน</b>"))
         return
 
 
@@ -381,15 +402,15 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     victim = ev.new_chat_member.user
     actor = ev.from_user
 
+    log.info("chat_member event: %s(%s) %s->%s victim=%s actor=%s",
+             chat.title, chat.type, old, new, victim.id, actor.id if actor else None)
+
     # กันลูป: บอทเป็นคนทำเอง (เช่น แคปช่าเตะ) — ไม่ต้องตอบโต้
     if actor and actor.id == context.bot.id:
         return
 
-    # โหมด audit — แจ้งเตือนทุกความเคลื่อนไหว (ใครเตะ/เพิ่ม/ตั้งแอดมินใคร) ไม่กรองใคร ไม่ตอบโต้
+    # โหมด audit — แจ้งทุกความเคลื่อนไหว (ไม่กรองใคร ไม่ตอบโต้); กันซ้ำกับ service message ผ่าน _audit_once
     if ANTIKICK_MODE == "audit":
-        # กลุ่มธรรมดา (basic) จับผ่าน "ข้อความระบบ" แทน (on_service_message) — กันแจ้งซ้ำ
-        if chat.type == "group":
-            return
         await _audit(context, ev)
         return
 
@@ -531,11 +552,14 @@ async def _audit_service(context, message) -> None:
 
     if message.left_chat_member is not None:
         v = message.left_chat_member
-        self_act = actor is not None and actor.id == v.id
-        header = "👋 <b>ออกจากกลุ่มเอง</b>" if self_act else "🦶 <b>ถูกเตะออกจากกลุ่ม</b>"
-        await _broadcast(context, chat, card(header, v))
+        if v.id != context.bot.id and _audit_once(chat.id, v.id, "leave"):
+            self_act = actor is not None and actor.id == v.id
+            header = "👋 <b>ออกจากกลุ่มเอง</b>" if self_act else "🦶 <b>ถูกเตะออกจากกลุ่ม</b>"
+            await _broadcast(context, chat, card(header, v))
     for v in (message.new_chat_members or []):
         if v.id == context.bot.id:  # บอทเข้าเอง — ข้าม (มี on_my_chat_member แล้ว)
+            continue
+        if not _audit_once(chat.id, v.id, "join"):
             continue
         self_act = actor is not None and actor.id == v.id
         header = "➕ <b>เข้ากลุ่มเอง</b>" if self_act else "➕ <b>ถูกเพิ่มเข้ากลุ่ม</b>"
@@ -543,12 +567,17 @@ async def _audit_service(context, message) -> None:
 
 
 async def on_service_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """จับข้อความระบบ เข้า/ออก/เตะ — ใช้กับกลุ่มธรรมดา (supergroup ใช้ chat_member)"""
+    """จับข้อความระบบ เข้า/ออก/เตะ (ทุกชนิดกลุ่ม) — กันซ้ำกับ chat_member ผ่าน _audit_once"""
     if not GUARD_ENABLED or ANTIKICK_MODE != "audit":
         return
     message = update.effective_message
-    if message is None or message.chat.type != "group":
+    if message is None:
         return
+    log.info("service event: %s(%s) left=%s new=%s from=%s",
+             message.chat.title, message.chat.type,
+             message.left_chat_member.id if message.left_chat_member else None,
+             [u.id for u in (message.new_chat_members or [])],
+             message.from_user.id if message.from_user else None)
     if message.from_user and message.from_user.id == context.bot.id:
         return
     await _audit_service(context, message)

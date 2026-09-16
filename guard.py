@@ -387,6 +387,9 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # โหมด audit — แจ้งเตือนทุกความเคลื่อนไหว (ใครเตะ/เพิ่ม/ตั้งแอดมินใคร) ไม่กรองใคร ไม่ตอบโต้
     if ANTIKICK_MODE == "audit":
+        # กลุ่มธรรมดา (basic) จับผ่าน "ข้อความระบบ" แทน (on_service_message) — กันแจ้งซ้ำ
+        if chat.type == "group":
+            return
         await _audit(context, ev)
         return
 
@@ -489,6 +492,66 @@ async def _rescue(context, chat, actor, victim) -> None:
     if invite:
         msg += "\nส่งลิงก์เชิญกลับให้เหยื่อทาง DM แล้ว"
     await _broadcast(context, chat, msg)
+
+
+async def _audit_service(context, message) -> None:
+    """audit กลุ่มธรรมดา — จับจาก 'ข้อความระบบ' (ไม่ต้องเป็นแอดมิน แค่อยู่ในกลุ่ม+ปิด privacy)"""
+    chat = message.chat
+    actor = message.from_user
+    when = message.date
+
+    count_line = ""
+    try:
+        n = await context.bot.get_chat_member_count(chat.id)
+        count_line = f"📊 สมาชิกตอนนี้: {n} คน"
+    except Exception:  # noqa: BLE001
+        pass
+    actor_role = ""
+    if actor:
+        try:
+            am = await context.bot.get_chat_member(chat.id, actor.id)
+            actor_role = _status_th(am.status)
+        except Exception:  # noqa: BLE001
+            pass
+
+    time_line = f"🕐 {_fmt_time(when)}"
+    group_line = f"👥 กลุ่ม: {html.escape(chat.title or '')}\n🆔 <code>{chat.id}</code>"
+
+    def card(header: str, victim) -> str:
+        self_act = actor is not None and actor.id == victim.id
+        blocks = [f"{header}\n━━━━━━━━━━━━━━━", _person_block("👤 <b>สมาชิก</b>", victim)]
+        if not self_act:
+            blocks.append(_person_block("🙋 <b>ผู้ทำรายการ</b>", actor, actor_role))
+        blocks.append(time_line)
+        grp = [group_line]
+        if count_line:
+            grp.append(count_line)
+        blocks.append("\n".join(grp))
+        return "\n\n".join(blocks)
+
+    if message.left_chat_member is not None:
+        v = message.left_chat_member
+        self_act = actor is not None and actor.id == v.id
+        header = "👋 <b>ออกจากกลุ่มเอง</b>" if self_act else "🦶 <b>ถูกเตะออกจากกลุ่ม</b>"
+        await _broadcast(context, chat, card(header, v))
+    for v in (message.new_chat_members or []):
+        if v.id == context.bot.id:  # บอทเข้าเอง — ข้าม (มี on_my_chat_member แล้ว)
+            continue
+        self_act = actor is not None and actor.id == v.id
+        header = "➕ <b>เข้ากลุ่มเอง</b>" if self_act else "➕ <b>ถูกเพิ่มเข้ากลุ่ม</b>"
+        await _broadcast(context, chat, card(header, v))
+
+
+async def on_service_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """จับข้อความระบบ เข้า/ออก/เตะ — ใช้กับกลุ่มธรรมดา (supergroup ใช้ chat_member)"""
+    if not GUARD_ENABLED or ANTIKICK_MODE != "audit":
+        return
+    message = update.effective_message
+    if message is None or message.chat.type != "group":
+        return
+    if message.from_user and message.from_user.id == context.bot.id:
+        return
+    await _audit_service(context, message)
 
 
 # ================= 2) แคปช่า =================
@@ -889,6 +952,14 @@ def register(app) -> None:
     app.add_handler(ChatMemberHandler(on_new_member, ChatMemberHandler.CHAT_MEMBER), group=1)
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER), group=2)
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER), group=3)
+    # ข้อความระบบ เข้า/ออก/เตะ (สำหรับกลุ่มธรรมดา ไม่ต้องเป็นแอดมิน)
+    app.add_handler(
+        MessageHandler(
+            filters.StatusUpdate.NEW_CHAT_MEMBERS | filters.StatusUpdate.LEFT_CHAT_MEMBER,
+            on_service_message,
+        ),
+        group=4,
+    )
     # ปุ่มแคปช่า
     app.add_handler(CallbackQueryHandler(on_captcha_click, pattern=r"^cap:"))
     # คำสั่งจัดการ (default group; ชื่อไม่ชนของเดิม /start /status)

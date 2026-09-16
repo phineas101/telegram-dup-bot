@@ -264,15 +264,13 @@ def _status_th(s) -> str:
     return _STATUS_TH.get(s, str(s))
 
 
-def _udetail(label: str, user, role: str = "") -> str:
-    """รายละเอียดผู้ใช้: ชื่อ (กดได้) + @username + ตำแหน่ง + ป้าย (Premium/Bot/ภาษา) + user id"""
+def _person_block(title: str, user, role: str = "") -> str:
+    """บล็อกข้อมูลผู้ใช้แบบอ่านง่าย: หัวข้อ / ชื่อ+ป้าย / ตำแหน่ง / user id"""
     if user is None:
-        return f"{label} —"
-    s = mention(user)
+        return f"{title}\n—"
+    name = mention(user)
     if getattr(user, "username", None):
-        s += f" (@{user.username})"
-    if role:
-        s += f" · {role}"
+        name += f" (@{user.username})"
     badges = []
     if getattr(user, "is_premium", None):
         badges.append("⭐Premium")
@@ -282,11 +280,15 @@ def _udetail(label: str, user, role: str = "") -> str:
     if lang:
         badges.append(f"🌐{lang}")
     tail = ("  " + " ".join(badges)) if badges else ""
-    return f"{label} {s}{tail}\n     🆔 <code>{user.id}</code>"
+    lines = [title, f"{name}{tail}"]
+    if role:
+        lines.append(f"📋 ตำแหน่ง: {role}")
+    lines.append(f"🆔 <code>{user.id}</code>")
+    return "\n".join(lines)
 
 
 async def _audit(context, ev) -> None:
-    """โหมด audit — การ์ดรายงานละเอียดสุดทุกความเคลื่อนไหว (ไม่กรองใคร ไม่ตอบโต้)"""
+    """โหมด audit — การ์ดรายงานละเอียดสุด อ่านง่าย ทุกความเคลื่อนไหว (ไม่กรองใคร ไม่ตอบโต้)"""
     chat = ev.chat
     old = ev.old_chat_member.status
     new = ev.new_chat_member.status
@@ -294,11 +296,11 @@ async def _audit(context, ev) -> None:
     actor = ev.from_user
     self_act = actor is not None and actor.id == victim.id
 
-    # ข้อมูลเสริม (best-effort — ถ้าเรียกไม่ได้ก็ข้าม ไม่ให้พัง)
+    # ข้อมูลเสริม (best-effort — เรียกไม่ได้ก็ข้าม)
     count_line = ""
     try:
         n = await context.bot.get_chat_member_count(chat.id)
-        count_line = f"\n👥 สมาชิกกลุ่มตอนนี้: {n} คน"
+        count_line = f"📊 สมาชิกตอนนี้: {n} คน"
     except Exception:  # noqa: BLE001
         pass
     actor_role = ""
@@ -316,21 +318,33 @@ async def _audit(context, ev) -> None:
         if il is not None:
             name = html.escape(il.name or il.invite_link or "")
             creator = f" · สร้างโดย {mention(il.creator)}" if il.creator else ""
-            join_line = f"\n🔗 เข้าผ่านลิงก์: {name}{creator}"
+            join_line = f"🔗 เข้าผ่านลิงก์: {name}{creator}"
         elif getattr(ev, "via_join_request", False):
-            join_line = "\n🔗 เข้าผ่าน: คำขอเข้ากลุ่ม (ได้รับอนุมัติ)"
+            join_line = "🔗 เข้าผ่าน: คำขอเข้ากลุ่ม (ได้รับอนุมัติ)"
         elif getattr(ev, "via_chat_folder_invite_link", False):
-            join_line = "\n🔗 เข้าผ่าน: ลิงก์โฟลเดอร์"
+            join_line = "🔗 เข้าผ่าน: ลิงก์โฟลเดอร์"
 
-    time_line = f"🕐 {_fmt_time(ev.date)}"
-    group_line = f"👥 กลุ่ม: {html.escape(chat.title or '')} (<code>{chat.id}</code>)"
     trans_line = f"🔁 สถานะ: {_status_th(old)} → {_status_th(new)}"
+    time_line = f"🕐 {_fmt_time(ev.date)}"
+    group_line = f"👥 กลุ่ม: {html.escape(chat.title or '')}\n🆔 <code>{chat.id}</code>"
 
     def card(header: str) -> str:
-        lines = [header, "━━━━━━━━━━━━", _udetail("👤 สมาชิก:", victim)]
+        blocks = [
+            f"{header}\n━━━━━━━━━━━━━━━",
+            _person_block("👤 <b>สมาชิก</b>", victim),
+        ]
         if not self_act:
-            lines.append(_udetail("🙋 โดย:", actor, actor_role))
-        return "\n".join(lines) + f"\n{trans_line}{join_line}\n{time_line}\n{group_line}{count_line}"
+            blocks.append(_person_block("🙋 <b>ผู้ทำรายการ</b>", actor, actor_role))
+        meta = [trans_line]
+        if join_line:
+            meta.append(join_line)
+        meta.append(time_line)
+        blocks.append("\n".join(meta))
+        grp = [group_line]
+        if count_line:
+            grp.append(count_line)
+        blocks.append("\n".join(grp))
+        return "\n\n".join(blocks)
 
     if old in _PRESENT and new in _GONE:
         if self_act:
@@ -703,14 +717,49 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 # ================= my_chat_member (บอทถูกตั้ง/ถอดแอดมิน) =================
+async def _notify_admins(context, text: str) -> None:
+    """ส่งไปที่ห้อง Log + เจ้าของ (ที่คนในกลุ่มลบไม่ได้) — ใช้ตอนบอทถูกเอาออก/ถอด"""
+    targets = [t for t in dict.fromkeys([LOG_CHAT_ID, OWNER_ID]) if t]
+    if not targets:
+        log.warning("บอทถูกเอาออก/ถอด แต่ไม่มี LOG_CHAT_ID/OWNER_ID ให้แจ้ง — ตั้งไว้จะได้รู้ทัน")
+        return
+    for t in targets:
+        await _notify(context, t, text)
+
+
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ev = update.my_chat_member
     if ev is None:
         return
+    old = ev.old_chat_member.status
     new = ev.new_chat_member.status
     chat = ev.chat
-    log.info("สถานะบอทในกลุ่ม %s (%s): %s -> %s",
-             chat.title, chat.id, ev.old_chat_member.status, new)
+    actor = ev.from_user
+    log.info("สถานะบอทในกลุ่ม %s (%s): %s -> %s", chat.title, chat.id, old, new)
+
+    title = html.escape(chat.title or "")
+    by = f"\n🙋 โดย: {mention(actor)}" if (actor and actor.id != context.bot.id) else ""
+    meta = f"\n👥 กลุ่ม: {title} (<code>{chat.id}</code>){by}\n🕐 {_fmt_time(ev.date)}"
+
+    # บอทถูกเอาออก/แบน — ส่งแจ้งสุดท้ายไปที่ Log/เจ้าของ (กลบหลักฐานไม่ได้)
+    if new in _GONE:
+        await _notify_admins(
+            context,
+            f"🚨 <b>บอทถูกเอาออกจากกลุ่ม!</b>{meta}\n\n"
+            f"⚠️ ระบบแจ้งเตือนในกลุ่มนี้หยุดทำงานแล้ว — ตรวจสอบด่วน",
+        )
+        return
+
+    # บอทถูกถอดจากแอดมิน — จะมองไม่เห็นเหตุการณ์อีก
+    if old == ChatMemberStatus.ADMINISTRATOR and new in {ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED}:
+        await _notify_admins(
+            context,
+            f"⚠️ <b>บอทถูกถอดจากแอดมิน!</b>{meta}\n\n"
+            f"บอทจะมองไม่เห็นการเตะ/เพิ่มในกลุ่มนี้อีก — ตรวจสอบด่วน",
+        )
+        return
+
+    # บอทได้เป็นแอดมิน — ต้อนรับ
     if new == ChatMemberStatus.ADMINISTRATOR:
         try:
             await context.bot.send_message(

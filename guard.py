@@ -105,14 +105,24 @@ def _store_load() -> None:
             d = os.path.dirname(path)
             if d:
                 os.makedirs(d, exist_ok=True)
+            data = {"trusted_admins": [], "warns": {}}
             if os.path.exists(path):
-                _store = json.loads(open(path, encoding="utf-8").read())
-            _store.setdefault("trusted_admins", [])
-            _store.setdefault("warns", {})
+                try:
+                    data = json.loads(open(path, encoding="utf-8").read())
+                except Exception as e:  # ไฟล์เสีย (JSONDecodeError ฯลฯ) — เริ่มใหม่ ไม่ crash
+                    log.warning("guard storage ที่ %s อ่านไม่ได้ (%s) — เริ่มใหม่", path, e)
+                    data = {"trusted_admins": [], "warns": {}}
+            data.setdefault("trusted_admins", [])
+            data.setdefault("warns", {})
+            _store = data
             _store_path = path
+            # พิสูจน์ว่าเขียนได้จริง (ถ้า /data ไม่ได้ mount จะ throw → ตกไป path ถัดไป)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(_store, f, ensure_ascii=False, indent=2)
+            log.info("guard storage: %s", path)
             return
-        except OSError as e:
-            log.warning("เปิด guard storage ที่ %s ไม่ได้ (%s) — ลองที่อื่น", path, e)
+        except Exception as e:  # noqa: BLE001
+            log.warning("ใช้ guard storage ที่ %s ไม่ได้ (%s) — ลองที่อื่น", path, e)
     _store_path = "guard_storage.json"
 
 
@@ -445,6 +455,17 @@ async def _cap_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ================= 3) กันสแปม =================
 _flood: dict[tuple[int, int], deque] = defaultdict(deque)
+_flood_last_sweep = [0.0]
+
+
+def _flood_sweep(now: float) -> None:
+    """ลบ key ที่ไม่มี timestamp ในหน้าต่างเวลาแล้ว — กัน _flood โตไม่หยุด"""
+    for k in list(_flood.keys()):
+        dq = _flood[k]
+        while dq and now - dq[0] > FLOOD_WINDOW_SEC:
+            dq.popleft()
+        if not dq:
+            del _flood[k]
 
 
 def _has_link(message) -> bool:
@@ -516,12 +537,15 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # 1) ฟลัด — ส่งถี่เกินในหน้าต่างเวลา -> มิวต์
     if FLOOD_ENABLED:
         now = time.time()
+        if now - _flood_last_sweep[0] > 300:  # กวาด key เก่าทุก 5 นาที
+            _flood_last_sweep[0] = now
+            _flood_sweep(now)
         dq = _flood[(chat_id, user.id)]
         dq.append(now)
         while dq and now - dq[0] > FLOOD_WINDOW_SEC:
             dq.popleft()
         if len(dq) > FLOOD_MAX_MSGS:
-            dq.clear()
+            del _flood[(chat_id, user.id)]
             until = datetime.now(timezone.utc) + timedelta(minutes=FLOOD_MUTE_MINUTES)
             try:
                 await context.bot.restrict_chat_member(chat_id, user.id, permissions=MUTED, until_date=until)

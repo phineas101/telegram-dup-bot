@@ -19,6 +19,7 @@ import os
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from telegram import (
     ChatPermissions,
@@ -82,6 +83,11 @@ WARN_MUTE_MINUTES = _env_int("WARN_MUTE_MINUTES", 60)
 
 # ตำแหน่งไฟล์เก็บข้อมูลถาวร (Volume เดียวกับบอทเดิม)
 GUARD_STORE_PATH = os.environ.get("GUARD_STORE_PATH", "/data/guard_storage.json")
+
+# โซนเวลาสำหรับแสดงเวลาในรายงาน (ไทย)
+GUARD_TZ = ZoneInfo(os.environ.get("TZ_NAME", "Asia/Bangkok"))
+_TH_MONTHS = ["", "ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.",
+              "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."]
 
 # ---------- สิทธิ์ ----------
 MUTED = ChatPermissions(can_send_messages=False)
@@ -237,36 +243,60 @@ def _is_anonymous(actor, chat) -> bool:
     return getattr(actor, "username", None) == "GroupAnonymousBot"
 
 
-async def _audit(context, chat, old, new, victim, actor) -> None:
-    """โหมด audit — โพสต์แจ้งทุกความเคลื่อนไหวของสมาชิก (ไม่กรองใคร ไม่ตอบโต้)"""
-    by = f" โดย {mention(actor)}" if (actor and actor.id != victim.id) else ""
+def _fmt_time(when) -> str:
+    """เวลาไทยแบบละเอียด เช่น '16 ก.ย. 2026 เวลา 15:44:30 น.'"""
+    dt = when.astimezone(GUARD_TZ) if when else datetime.now(GUARD_TZ)
+    return (f"{dt.day} {_TH_MONTHS[dt.month]} {dt.year} "
+            f"เวลา {dt.strftime('%H:%M:%S')} น.")
+
+
+def _uline(label: str, user) -> str:
+    """บรรทัดรายละเอียดผู้ใช้: ชื่อ (กดได้) + @username + user id"""
+    if user is None:
+        return f"{label} —"
+    name = mention(user)
+    if getattr(user, "username", None):
+        name += f" (@{user.username})"
+    return f"{label} {name}\n     🆔 <code>{user.id}</code>"
+
+
+async def _audit(context, chat, old, new, victim, actor, when=None) -> None:
+    """โหมด audit — โพสต์การ์ดรายงานละเอียดทุกความเคลื่อนไหว (ไม่กรองใคร ไม่ตอบโต้)"""
+    self_act = actor is not None and actor.id == victim.id
+    group_line = f"👥 กลุ่ม: {html.escape(chat.title or '')} (<code>{chat.id}</code>)"
+    time_line = f"🕐 {_fmt_time(when)}"
+
+    def card(header: str, show_actor: bool = True) -> str:
+        lines = [header, "━━━━━━━━━━━━", _uline("👤 สมาชิก:", victim)]
+        if show_actor and not self_act:
+            lines.append(_uline("🙋 โดย:", actor))
+        lines += [time_line, group_line]
+        return "\n".join(lines)
 
     # ถูกเอาออก (เตะ/แบน/ออกเอง)
     if old in _PRESENT and new in _GONE:
-        if actor and actor.id == victim.id:
-            txt = f"👋 {mention(victim)} ออกจากกลุ่มเอง"
+        if self_act:
+            header = "👋 <b>ออกจากกลุ่มเอง</b>"
         elif new == ChatMemberStatus.BANNED:
-            txt = f"🚫 {mention(victim)} <b>ถูกแบน</b>{by}"
+            header = "🚫 <b>ถูกแบนออกจากกลุ่ม</b>"
         else:
-            txt = f"🦶 {mention(victim)} <b>ถูกเตะออก</b>{by}"
-        await _broadcast(context, chat, txt)
+            header = "🦶 <b>ถูกเตะออกจากกลุ่ม</b>"
+        await _broadcast(context, chat, card(header))
         return
 
     # เข้ากลุ่ม (ถูกเพิ่ม/เข้าเอง)
     if old in _GONE and new == ChatMemberStatus.MEMBER:
-        if actor and actor.id != victim.id:
-            txt = f"➕ {mention(victim)} <b>ถูกเพิ่มเข้ากลุ่ม</b>{by}"
-        else:
-            txt = f"➕ {mention(victim)} เข้ากลุ่ม (ผ่านลิงก์/เข้าเอง)"
-        await _broadcast(context, chat, txt)
+        header = ("➕ <b>เข้ากลุ่มเอง (ผ่านลิงก์)</b>" if self_act
+                  else "➕ <b>ถูกเพิ่มเข้ากลุ่ม</b>")
+        await _broadcast(context, chat, card(header))
         return
 
     # ตั้ง/ถอดแอดมิน
     if new == ChatMemberStatus.ADMINISTRATOR and old != ChatMemberStatus.ADMINISTRATOR:
-        await _broadcast(context, chat, f"⭐ {mention(victim)} <b>ถูกตั้งเป็นแอดมิน</b>{by}")
+        await _broadcast(context, chat, card("⭐ <b>ถูกตั้งเป็นแอดมิน</b>"))
         return
     if old == ChatMemberStatus.ADMINISTRATOR and new in {ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED}:
-        await _broadcast(context, chat, f"🔻 {mention(victim)} <b>ถูกถอดจากแอดมิน</b>{by}")
+        await _broadcast(context, chat, card("🔻 <b>ถูกถอดจากแอดมิน</b>"))
         return
 
 
@@ -288,7 +318,7 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # โหมด audit — แจ้งเตือนทุกความเคลื่อนไหว (ใครเตะ/เพิ่ม/ตั้งแอดมินใคร) ไม่กรองใคร ไม่ตอบโต้
     if ANTIKICK_MODE == "audit":
-        await _audit(context, chat, old, new, victim, actor)
+        await _audit(context, chat, old, new, victim, actor, when=ev.date)
         return
 
     if old in _PRESENT and new in _GONE:

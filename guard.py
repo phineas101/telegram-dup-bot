@@ -59,7 +59,8 @@ GUARD_ENABLED = _env_bool("GUARD_ENABLED", True)          # สวิตช์�
 OWNER_ID = _env_int("OWNER_ID", 0)                        # เจ้าของบอท (0 = ยังไม่ตั้ง)
 LOG_CHAT_ID = _env_int("LOG_CHAT_ID", 0)                  # ห้องรับแจ้งเตือน (0 = ไม่มี)
 
-# กันเตะ: off | alert (แจ้งอย่างเดียว) | enforce (ตอบโต้จริง) — เริ่มที่ alert เพื่อความปลอดภัย
+# กันเตะ: off | audit (แจ้งทุกการเข้า-ออก-เตะ-เพิ่ม ไม่กรองใคร ไม่ตอบโต้)
+#         | alert (แจ้งเฉพาะคนไม่ไว้ใจเตะ) | enforce (ตอบโต้จริง: ถอดแอดมิน+กู้เหยื่อ)
 ANTIKICK_MODE = os.environ.get("ANTIKICK_MODE", "alert").strip().lower()
 WATCH_NEW_ADMINS = _env_bool("WATCH_NEW_ADMINS", True)
 
@@ -236,6 +237,39 @@ def _is_anonymous(actor, chat) -> bool:
     return getattr(actor, "username", None) == "GroupAnonymousBot"
 
 
+async def _audit(context, chat, old, new, victim, actor) -> None:
+    """โหมด audit — โพสต์แจ้งทุกความเคลื่อนไหวของสมาชิก (ไม่กรองใคร ไม่ตอบโต้)"""
+    by = f" โดย {mention(actor)}" if (actor and actor.id != victim.id) else ""
+
+    # ถูกเอาออก (เตะ/แบน/ออกเอง)
+    if old in _PRESENT and new in _GONE:
+        if actor and actor.id == victim.id:
+            txt = f"👋 {mention(victim)} ออกจากกลุ่มเอง"
+        elif new == ChatMemberStatus.BANNED:
+            txt = f"🚫 {mention(victim)} <b>ถูกแบน</b>{by}"
+        else:
+            txt = f"🦶 {mention(victim)} <b>ถูกเตะออก</b>{by}"
+        await _broadcast(context, chat, txt)
+        return
+
+    # เข้ากลุ่ม (ถูกเพิ่ม/เข้าเอง)
+    if old in _GONE and new == ChatMemberStatus.MEMBER:
+        if actor and actor.id != victim.id:
+            txt = f"➕ {mention(victim)} <b>ถูกเพิ่มเข้ากลุ่ม</b>{by}"
+        else:
+            txt = f"➕ {mention(victim)} เข้ากลุ่ม (ผ่านลิงก์/เข้าเอง)"
+        await _broadcast(context, chat, txt)
+        return
+
+    # ตั้ง/ถอดแอดมิน
+    if new == ChatMemberStatus.ADMINISTRATOR and old != ChatMemberStatus.ADMINISTRATOR:
+        await _broadcast(context, chat, f"⭐ {mention(victim)} <b>ถูกตั้งเป็นแอดมิน</b>{by}")
+        return
+    if old == ChatMemberStatus.ADMINISTRATOR and new in {ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED}:
+        await _broadcast(context, chat, f"🔻 {mention(victim)} <b>ถูกถอดจากแอดมิน</b>{by}")
+        return
+
+
 async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not GUARD_ENABLED or ANTIKICK_MODE == "off":
         return
@@ -250,6 +284,11 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # กันลูป: บอทเป็นคนทำเอง (เช่น แคปช่าเตะ) — ไม่ต้องตอบโต้
     if actor and actor.id == context.bot.id:
+        return
+
+    # โหมด audit — แจ้งเตือนทุกความเคลื่อนไหว (ใครเตะ/เพิ่ม/ตั้งแอดมินใคร) ไม่กรองใคร ไม่ตอบโต้
+    if ANTIKICK_MODE == "audit":
+        await _audit(context, chat, old, new, victim, actor)
         return
 
     if old in _PRESENT and new in _GONE:
@@ -688,7 +727,7 @@ async def cmd_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [
         "🛡️ <b>สถานะระบบป้องกันกลุ่ม</b>",
         f"สวิตช์ใหญ่: {'เปิด' if GUARD_ENABLED else 'ปิด'}",
-        f"กันเตะ: <b>{ANTIKICK_MODE}</b> (off/alert/enforce)",
+        f"กันเตะ: <b>{ANTIKICK_MODE}</b> (off/audit/alert/enforce)",
         f"แคปช่า: {'เปิด' if CAPTCHA_ENABLED else 'ปิด'} ({CAPTCHA_TIMEOUT_SEC}s)",
         f"กันสแปม: {'เปิด' if ANTISPAM_ENABLED else 'ปิด'} "
         f"(ฟลัด {FLOOD_MAX_MSGS}/{FLOOD_WINDOW_SEC}s, ลิงก์ {'เปิด' if LINKS_ENABLED else 'ปิด'}, "

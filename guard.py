@@ -271,6 +271,21 @@ def _status_th(s) -> str:
     return _STATUS_TH.get(s, str(s))
 
 
+# รหัสภาษา -> ชื่อภาษาไทย (เบาะแส "ภาษาแอป" ไม่ใช่ประเทศจริง)
+_LANG_TH = {
+    "th": "ไทย", "en": "อังกฤษ", "ko": "เกาหลี", "zh": "จีน", "ja": "ญี่ปุ่น",
+    "lo": "ลาว", "my": "พม่า", "km": "เขมร", "vi": "เวียดนาม", "ms": "มาเลย์",
+    "id": "อินโดนีเซีย", "tl": "ฟิลิปปินส์", "hi": "ฮินดี", "ru": "รัสเซีย",
+    "ar": "อาหรับ", "fr": "ฝรั่งเศส", "de": "เยอรมัน", "es": "สเปน", "pt": "โปรตุเกส",
+}
+
+
+def _lang_label(code: str) -> str:
+    if not code:
+        return ""
+    return _LANG_TH.get(code.split("-")[0].lower(), code)
+
+
 def _person_block(title: str, user, role: str = "", custom_title: str = "", bio: str = "") -> str:
     """บล็อกข้อมูลผู้ใช้แบบอ่านง่าย: หัวข้อ / ชื่อ+ป้าย / ตำแหน่ง / bio / user id"""
     if user is None:
@@ -285,7 +300,7 @@ def _person_block(title: str, user, role: str = "", custom_title: str = "", bio:
         badges.append("🤖Bot")
     lang = getattr(user, "language_code", None)
     if lang:
-        badges.append(f"🌐{lang}")
+        badges.append(f"🌐{_lang_label(lang)}")
     tail = ("  " + " ".join(badges)) if badges else ""
     lines = [title, f"{name}{tail}"]
     if role:

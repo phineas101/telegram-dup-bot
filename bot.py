@@ -134,6 +134,13 @@ except Exception:
     guard = None
     logger.error("โหลด guard.py ไม่สำเร็จ — บอทเดิมทำงานต่อได้ปกติ", exc_info=True)
 
+# ---------- ฟีเจอร์เสริม: ตรวจข้อความซ้ำ "ข้ามกลุ่ม" (crossgroup.py) ----------
+try:
+    import crossgroup
+except Exception:
+    crossgroup = None
+    logger.error("โหลด crossgroup.py ไม่สำเร็จ — บอทเดิมทำงานต่อได้ปกติ", exc_info=True)
+
 # ---------- ฐานข้อมูล (SQLite) ----------
 _db: sqlite3.Connection | None = None
 
@@ -408,6 +415,13 @@ def main() -> None:
             guard.register(app)
         except Exception:
             logger.error("guard.register ล้มเหลว — บอทเดิมทำงานต่อ", exc_info=True)
+
+    # ตรวจข้อความซ้ำข้ามกลุ่ม (crossgroup) — ไม่กระทบของเดิม
+    if crossgroup is not None:
+        try:
+            crossgroup.register(app)
+        except Exception:
+            logger.error("crossgroup.register ล้มเหลว — บอทเดิมทำงานต่อ", exc_info=True)
 
     logger.info("บอทเริ่มทำงาน (ช่วงเวลาตรวจซ้ำ = %s นาที)", DUP_WINDOW_MINUTES)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)

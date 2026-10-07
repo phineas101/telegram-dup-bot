@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 venv/
 .venv/
+
+# ไฟล์ข้อมูล (มีเนื้อหาข้อความจริง — ห้ามขึ้น repo)
+*.db
+guard_storage.json

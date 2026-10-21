@@ -141,13 +141,6 @@ except Exception:
     crossgroup = None
     logger.error("โหลด crossgroup.py ไม่สำเร็จ — บอทเดิมทำงานต่อได้ปกติ", exc_info=True)
 
-# ---------- ส่งข้อมูลขึ้นแดชบอร์ด (supa.py) — ไม่กระทบงานเดิม ----------
-try:
-    import supa
-except Exception:
-    supa = None
-    logger.error("โหลด supa.py ไม่สำเร็จ — บอทเดิมทำงานต่อได้ปกติ", exc_info=True)
-
 # ---------- ฐานข้อมูล (SQLite) ----------
 _db: sqlite3.Connection | None = None
 
@@ -337,13 +330,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     result = check_and_record(chat_id, text, message.message_id, now)
 
-    # ส่งข้อมูลขึ้นแดชบอร์ด (fire-and-forget — ถ้า Supabase ล่มก็ไม่กระทบงานเดิม)
-    if supa is not None and supa.enabled:
-        supa.touch_group(chat_id, message.chat.title)
-        if result is not None:
-            supa.log_duplicate(chat_id, "in_group",
-                               text_hash=make_hash(text), text_preview=text[:120])
-
     if result is not None:
         prev_ts, prev_msg_id = result
         ago = now - prev_ts
@@ -436,11 +422,6 @@ def main() -> None:
             crossgroup.register(app)
         except Exception:
             logger.error("crossgroup.register ล้มเหลว — บอทเดิมทำงานต่อ", exc_info=True)
-
-    # ส่งข้อมูลขึ้นแดชบอร์ด: heartbeat ทุก 5 นาที (fire-and-forget)
-    if supa is not None and supa.enabled and app.job_queue is not None:
-        app.job_queue.run_repeating(supa.heartbeat_job, interval=300, first=5)
-        logger.info("supa: เปิดส่งข้อมูลขึ้นแดชบอร์ด (bot_id=%s)", supa.BOT_ID)
 
     logger.info("บอทเริ่มทำงาน (ช่วงเวลาตรวจซ้ำ = %s นาที)", DUP_WINDOW_MINUTES)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)

@@ -34,12 +34,6 @@ from telegram.ext import (
 
 log = logging.getLogger("crossgroup")
 
-# ส่งข้อมูลขึ้นแดชบอร์ด (ไม่บังคับ — ไม่มีก็ทำงานปกติ)
-try:
-    import supa
-except Exception:
-    supa = None
-
 
 def _env_bool(name: str, default: bool) -> bool:
     return os.environ.get(name, "on" if default else "off").strip().lower() in {
@@ -283,9 +277,6 @@ async def on_message_cross(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "cross-group dup: hash=%s โผล่ที่ %s เคยอยู่ที่ %s",
             h[:8], chat.id, row[0],
         )
-        if supa is not None and supa.enabled:
-            supa.log_duplicate(chat.id, "cross_group", text_hash=h, text_preview=text[:120],
-                               orig_chat_id=row[0], orig_chat_title=row[1], orig_sender=row[3])
         await _emit_warning(context, message, row)
 
 
